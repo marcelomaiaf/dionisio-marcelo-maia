@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dionisio Neo4j Graph Viewer</title>
+  <script src="https://unpkg.com/cytoscape@3.29.2/dist/cytoscape.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #667085;
+      --line: #d9dee8;
+      --accent: #2357c6;
+      --danger: #b42318;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: 360px minmax(0, 1fr);
+      height: 100vh;
+    }
+
+    aside {
+      overflow: auto;
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      padding: 18px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 18px;
+      line-height: 1.2;
+    }
+
+    p {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    label {
+      display: block;
+      margin: 12px 0 6px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #344054;
+    }
+
+    input,
+    select,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      color: var(--ink);
+      background: #fff;
+      font: inherit;
+      font-size: 13px;
+    }
+
+    textarea {
+      min-height: 122px;
+      resize: vertical;
+      font-family: "Cascadia Code", Consolas, monospace;
+      line-height: 1.4;
+    }
+
+    button {
+      width: 100%;
+      margin-top: 14px;
+      border: 0;
+      border-radius: 6px;
+      padding: 10px 12px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.55;
+      cursor: wait;
+    }
+
+    .status {
+      margin-top: 12px;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+      background: #fafbff;
+      white-space: pre-wrap;
+    }
+
+    .status.error {
+      border-color: #fda29b;
+      color: var(--danger);
+      background: #fff5f4;
+    }
+
+    #graph {
+      width: 100%;
+      height: 100vh;
+      background: #fbfcff;
+    }
+
+    @media (max-width: 900px) {
+      main {
+        grid-template-columns: 1fr;
+        height: auto;
+      }
+
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      #graph {
+        height: 70vh;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <aside>
+      <h1>Dionisio Neo4j Graph Viewer</h1>
+      <p>Visualizador direto via Neo4j HTTP API. A senha fica apenas nesta aba do navegador.</p>
+
+      <label for="endpoint">HTTP endpoint</label>
+      <input id="endpoint" value="https://dionisio-neo4j-production.up.railway.app" />
+
+      <label for="user">Usuario</label>
+      <input id="user" value="neo4j" autocomplete="username" />
+
+      <label for="password">Senha</label>
+      <input id="password" type="password" autocomplete="current-password" />
+
+      <label for="preset">Consulta</label>
+      <select id="preset">
+        <option value="overview">Amostra geral</option>
+        <option value="workflows">Workflows e operacoes</option>
+        <option value="reservation_reschedule">Workflow: remarcacao</option>
+        <option value="reactivation">Workflow: reativacao 60 dias</option>
+        <option value="unsupported">Fluxos nao suportados</option>
+        <option value="domains">Dependencias de dominios</option>
+        <option value="custom">Cypher customizado</option>
+      </select>
+
+      <label for="cypher">Cypher</label>
+      <textarea id="cypher"></textarea>
+
+      <button id="run">Carregar grafo</button>
+      <div id="status" class="status">Informe a senha e carregue uma consulta.</div>
+    </aside>
+
+    <section id="graph" aria-label="Graph visualization"></section>
+  </main>
+
+  <script>
+    const presets = {
+      overview: "MATCH p=(n)-[r]->(m) RETURN p LIMIT 180",
+      workflows: "MATCH p=(w:Workflow)-[:HAS_STEP]->(op:Operation) RETURN p LIMIT 220",
+      reservation_reschedule: "MATCH p=(:Workflow {key: 'workflow.reservation_reschedule_by_client_name'})-[*1..2]-() RETURN p LIMIT 180",
+      reactivation: "MATCH p=(:Workflow {key: 'workflow.inactive_client_reactivation_campaign_60_days'})-[*1..2]-() RETURN p LIMIT 180",
+      unsupported: "MATCH p=(w:Workflow {supported: false})-[*1..2]-() RETURN p LIMIT 180",
+      domains: "MATCH p=(:Domain)-[:DEPENDS_ON_DOMAIN|PRIMARY_ENTITY|HAS_OPERATION]->() RETURN p LIMIT 180",
+      custom: "MATCH p=(n)-[r]->(m) RETURN p LIMIT 100"
+    };
+
+    const endpointInput = document.getElementById("endpoint");
+    const userInput = document.getElementById("user");
+    const passwordInput = document.getElementById("password");
+    const presetInput = document.getElementById("preset");
+    const cypherInput = document.getElementById("cypher");
+    const runButton = document.getElementById("run");
+    const statusBox = document.getElementById("status");
+
+    const cy = cytoscape({
+      container: document.getElementById("graph"),
+      elements: [],
+      wheelSensitivity: 0.18,
+      style: [
+        {
+          selector: "node",
+          style: {
+            "background-color": "data(color)",
+            "border-color": "#ffffff",
+            "border-width": 2,
+            "label": "data(label)",
+            "font-size": 10,
+            "text-wrap": "wrap",
+            "text-max-width": 110,
+            "text-valign": "center",
+            "text-halign": "center",
+            "color": "#172033",
+            "width": "mapData(weight, 1, 20, 34, 72)",
+            "height": "mapData(weight, 1, 20, 34, 72)"
+          }
+        },
+        {
+          selector: "edge",
+          style: {
+            "curve-style": "bezier",
+            "target-arrow-shape": "triangle",
+            "target-arrow-color": "#8b95a5",
+            "line-color": "#b8c0cc",
+            "width": 1.3,
+            "label": "data(label)",
+            "font-size": 8,
+            "text-background-color": "#fbfcff",
+            "text-background-opacity": 0.86,
+            "text-background-padding": 2,
+            "color": "#475467"
+          }
+        }
+      ],
+      layout: { name: "grid" }
+    });
+
+    const colors = {
+      Workflow: "#a7f3d0",
+      WorkflowStep: "#bbf7d0",
+      Operation: "#bfdbfe",
+      Domain: "#fde68a",
+      Entity: "#fecaca",
+      Field: "#ddd6fe",
+      Parameter: "#c7d2fe",
+      ResponseSchema: "#bae6fd",
+      Endpoint: "#e5e7eb",
+      RiskPolicy: "#fed7aa",
+      SourceDocument: "#d1fae5"
+    };
+
+    function setStatus(message, isError = false) {
+      statusBox.textContent = message;
+      statusBox.classList.toggle("error", isError);
+    }
+
+    function nodeLabel(node) {
+      const props = node.properties || {};
+      const label = (node.labels || [])[0] || "Node";
+      return props.operation_id || props.name || props.key || props.path || node.id || label;
+    }
+
+    function toElements(graph) {
+      const nodes = new Map();
+      const edges = new Map();
+
+      for (const item of graph.nodes || []) {
+        const primary = (item.labels || [])[0] || "Node";
+        nodes.set(item.id, {
+          data: {
+            id: item.id,
+            label: nodeLabel(item),
+            type: primary,
+            color: colors[primary] || "#e2e8f0",
+            weight: primary === "Workflow" ? 14 : primary === "Operation" ? 10 : 5
+          }
+        });
+      }
+
+      for (const item of graph.relationships || []) {
+        const id = item.id || `${item.startNode}-${item.type}-${item.endNode}`;
+        edges.set(id, {
+          data: {
+            id,
+            source: item.startNode,
+            target: item.endNode,
+            label: item.type
+          }
+        });
+      }
+
+      return [...nodes.values(), ...edges.values()];
+    }
+
+    function mergeGraphs(results) {
+      const merged = { nodes: [], relationships: [] };
+      const nodeIds = new Set();
+      const relIds = new Set();
+
+      for (const result of results || []) {
+        for (const row of result.data || []) {
+          const graph = row.graph;
+          if (!graph) continue;
+          for (const node of graph.nodes || []) {
+            if (!nodeIds.has(node.id)) {
+              nodeIds.add(node.id);
+              merged.nodes.push(node);
+            }
+          }
+          for (const rel of graph.relationships || []) {
+            const id = rel.id || `${rel.startNode}-${rel.type}-${rel.endNode}`;
+            if (!relIds.has(id)) {
+              relIds.add(id);
+              merged.relationships.push(rel);
+            }
+          }
+        }
+      }
+
+      return merged;
+    }
+
+    async function runQuery() {
+      const endpoint = endpointInput.value.replace(/\/$/, "");
+      const username = userInput.value.trim();
+      const password = passwordInput.value;
+      const statement = cypherInput.value.trim();
+
+      if (!endpoint || !username || !password || !statement) {
+        setStatus("Preencha endpoint, usuario, senha e Cypher.", true);
+        return;
+      }
+
+      runButton.disabled = true;
+      setStatus("Carregando grafo...");
+
+      try {
+        const response = await fetch(`${endpoint}/db/neo4j/tx/commit`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Basic ${btoa(`${username}:${password}`)}`
+          },
+          body: JSON.stringify({
+            statements: [{ statement, resultDataContents: ["graph"] }]
+          })
+        });
+
+        const payload = await response.json();
+        if (!response.ok || (payload.errors && payload.errors.length)) {
+          throw new Error(JSON.stringify(payload.errors || payload, null, 2));
+        }
+
+        const graph = mergeGraphs(payload.results);
+        const elements = toElements(graph);
+        cy.elements().remove();
+        cy.add(elements);
+        cy.layout({
+          name: "cose",
+          animate: false,
+          fit: true,
+          padding: 40,
+          nodeRepulsion: 8000,
+          idealEdgeLength: 90,
+          numIter: 800
+        }).run();
+        setStatus(`Carregado: ${graph.nodes.length} nos, ${graph.relationships.length} relacoes.`);
+      } catch (error) {
+        setStatus(`Erro ao carregar: ${error.message}`, true);
+      } finally {
+        runButton.disabled = false;
+      }
+    }
+
+    presetInput.addEventListener("change", () => {
+      cypherInput.value = presets[presetInput.value];
+    });
+    runButton.addEventListener("click", runQuery);
+    cypherInput.value = presets[presetInput.value];
+  </script>
+</body>
+</html>
