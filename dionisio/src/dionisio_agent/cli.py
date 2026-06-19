@@ -7,21 +7,17 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from agents import MaxTurnsExceeded, Runner
+from agents import MaxTurnsExceeded
 
 from dionisio_agent.config import Settings
+from dionisio_agent.agent_runner import (
+    AGENT_MAX_TURNS_MESSAGE,
+    result_text,
+    run_agent_until_text,
+)
 from dionisio_agent.factory import create_runtime
 from dionisio_agent.operation_catalog import OperationCatalog
 from dionisio_agent.sessions import create_limited_sqlite_session
-
-AGENT_MAX_TURNS_MESSAGE = (
-    "Nao consegui concluir essa operacao em poucas etapas. Para avancar mais rapido, "
-    "envie o nome ou ID exato do registro e a acao desejada em uma unica mensagem."
-)
-AGENT_EMPTY_OUTPUT_MESSAGE = (
-    "Nao recebi uma resposta final do modelo neste turno. Tente reenviar a mensagem "
-    "ou repetir o pedido com o ID do registro."
-)
 
 
 def main() -> None:
@@ -53,11 +49,15 @@ async def _run(args: argparse.Namespace) -> None:
     if args.command == "ask":
         agent, _runtime = await create_runtime(settings)
         try:
-            result = await Runner.run(agent, args.prompt, max_turns=settings.agent_max_turns)
+            result = await run_agent_until_text(
+                agent,
+                args.prompt,
+                max_turns=settings.agent_max_turns,
+            )
         except MaxTurnsExceeded:
             print(AGENT_MAX_TURNS_MESSAGE)
             return
-        print(_result_text(result))
+        print(result_text(result))
         return
 
     if args.command == "chat":
@@ -87,7 +87,7 @@ async def _run(args: argparse.Namespace) -> None:
             if not prompt:
                 continue
             try:
-                result = await Runner.run(
+                result = await run_agent_until_text(
                     agent,
                     prompt,
                     session=session,
@@ -96,7 +96,7 @@ async def _run(args: argparse.Namespace) -> None:
             except MaxTurnsExceeded:
                 print(f"\nagente> {AGENT_MAX_TURNS_MESSAGE}")
                 continue
-            print(f"\nagente> {_result_text(result)}")
+            print(f"\nagente> {result_text(result)}")
 
         return
 
@@ -127,14 +127,6 @@ def _operation_to_dict(operation: Any) -> dict[str, Any]:
     }
 
 
-def _result_text(result: Any) -> str:
-    output = getattr(result, "final_output", None)
-    if output is None:
-        return AGENT_EMPTY_OUTPUT_MESSAGE
-    text = str(output)
-    if not text.strip():
-        return AGENT_EMPTY_OUTPUT_MESSAGE
-    return text
 
 
 if __name__ == "__main__":

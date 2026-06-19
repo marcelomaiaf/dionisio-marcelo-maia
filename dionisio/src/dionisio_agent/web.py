@@ -17,22 +17,18 @@ from fastapi.staticfiles import StaticFiles
 from openai.types.responses import ResponseTextDeltaEvent
 from pydantic import BaseModel, Field
 
+from dionisio_agent.agent_runner import (
+    AGENT_MAX_TURNS_MESSAGE,
+    FINALIZE_AFTER_TOOL_PROMPT,
+    ended_with_tool_output,
+    result_text,
+)
 from dionisio_agent.config import Settings
 from dionisio_agent.factory import create_runtime
 from dionisio_agent.sessions import create_limited_sqlite_session
 from dionisio_agent.tools import ToolRuntime
 
 logger = logging.getLogger(__name__)
-
-AGENT_MAX_TURNS_MESSAGE = (
-    "Nao consegui concluir essa operacao em poucas etapas. Para avancar mais rapido, "
-    "envie o nome ou ID exato do registro e a acao desejada em uma unica mensagem."
-)
-AGENT_EMPTY_OUTPUT_MESSAGE = (
-    "Nao recebi uma resposta final do modelo neste turno. Tente reenviar a mensagem "
-    "ou repetir o pedido com o ID do registro."
-)
-
 
 class WebChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
@@ -106,6 +102,8 @@ class WebChatBridge:
                     },
                 )
                 return AGENT_MAX_TURNS_MESSAGE
+            if ended_with_tool_output(result):
+                result = await self._run_agent(prompt=FINALIZE_AFTER_TOOL_PROMPT, session=session)
             logger.info(
                 "web_chat_agent_completed",
                 extra={
@@ -113,7 +111,7 @@ class WebChatBridge:
                     "latency_seconds": round(time.perf_counter() - started, 4),
                 },
             )
-        return _result_text(result)
+        return result_text(result)
 
     async def _run_agent(self, *, prompt: str, session: SQLiteSession) -> Any:
         return await Runner.run(
@@ -168,7 +166,16 @@ class WebChatBridge:
                 yield {"event": "delta", "data": {"text": AGENT_MAX_TURNS_MESSAGE}}
                 yield {"event": "done", "data": {}}
                 return
-            final_output = _result_text(result, fallback="".join(accumulated))
+            if ended_with_tool_output(result):
+                continuation = await self._run_agent(
+                    prompt=FINALIZE_AFTER_TOOL_PROMPT,
+                    session=session,
+                )
+                continuation_text = result_text(continuation)
+                accumulated.append(continuation_text)
+                yield {"event": "delta", "data": {"text": continuation_text}}
+                result = continuation
+            final_output = result_text(result, fallback="".join(accumulated))
             logger.info(
                 "web_chat_agent_stream_completed",
                 extra={
@@ -301,14 +308,6 @@ def build_web_chat_session_id(session_id: str) -> str:
 
 def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-def _result_text(result: Any, *, fallback: str = "") -> str:
-    output = getattr(result, "final_output", None)
-    text = str(output) if output is not None else fallback
-    if not text.strip():
-        return AGENT_EMPTY_OUTPUT_MESSAGE
-    return text
 
 
 app = create_app()
