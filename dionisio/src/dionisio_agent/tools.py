@@ -9,7 +9,7 @@ from agents import function_tool
 from dionisio_agent.api_client import DionisioAPIClient
 from dionisio_agent.approval import ApprovalStore, call_fingerprint
 from dionisio_agent.graphrag.retriever import Neo4jKnowledgeBase
-from dionisio_agent.operation_catalog import OperationCatalog, canonical_domain
+from dionisio_agent.operation_catalog import Operation, OperationCatalog, canonical_domain, normalize_token
 
 
 @dataclass
@@ -20,6 +20,8 @@ class ToolRuntime:
     interactive_approval: bool = False
     knowledge_base: Neo4jKnowledgeBase | None = None
     discovered_operation_ids: set[str] = field(default_factory=set)
+    operation_search_count: int = 0
+    last_operation_search_result_count: int = 0
 
 
 def create_tools(runtime: ToolRuntime) -> list[Any]:
@@ -32,12 +34,15 @@ def create_tools(runtime: ToolRuntime) -> list[Any]:
     ) -> dict[str, Any]:
         """Search the Dionisio OpenAPI catalog for operations relevant to a user request.
 
-        Use this after search_api_knowledge when the user asks for a Dionisio
-        API action or lookup. Prefer leaving domain and destructive unset for
-        discovery workflows, because reservation tasks often require operations
-        from both Clientes and Reservas. If domain is used, pass an exact
-        catalog domain or a known alias such as reservations, clients, orders,
-        coupons, promotions, delivery, store, analytics, ifood, or system.
+        This is the primary discovery tool for Dionisio API actions and lookups.
+        Use it before executing operations and before GraphRAG fallback. Build an
+        operation-planning confidence score from the returned operation_ids,
+        schemas, parameters, destructive flags, and missing required data. Prefer
+        leaving domain and destructive unset for discovery workflows, because
+        reservation tasks often require operations from both Clientes and
+        Reservas. If domain is used, pass an exact catalog domain or a known
+        alias such as reservations, clients, orders, coupons, promotions,
+        delivery, store, analytics, ifood, or system.
         """
         normalized_domain = canonical_domain(domain)
         matches = runtime.catalog.search(
@@ -46,6 +51,9 @@ def create_tools(runtime: ToolRuntime) -> list[Any]:
             destructive=destructive,
             limit=max(1, min(limit, 20)),
         )
+        matches = _include_workflow_operations(runtime.catalog, query, matches)
+        runtime.operation_search_count += 1
+        runtime.last_operation_search_result_count = len(matches)
         runtime.discovered_operation_ids.update(op.operation_id for op in matches)
         return {
             "applied_filters": {
@@ -203,18 +211,44 @@ def create_tools(runtime: ToolRuntime) -> list[Any]:
         @function_tool
         async def search_api_knowledge(
             query: str,
+            fallback_reason: str,
             domain: str | None = None,
             operation_id: str | None = None,
             limit: int = 5,
         ) -> dict[str, Any]:
             """Search the Neo4j GraphRAG knowledge base for Dionisio API concepts.
 
-            Call this before search_api_operations for Dionisio API requests. Use
-            it to understand semantic API context, ordered workflows, related
-            operations, required entities, fields, parameters, and risk policies.
-            This tool is read-only and best-effort; it never executes Dionisio
-            API operations.
+            This is a last-resort fallback context tool, not part of the main
+            flow. Use it only after search_api_operations when the OpenAPI
+            catalog results are still insufficient to understand the workflow,
+            relate required domains, or choose a safe response. Do not use it
+            for simple lookups, listings, direct creates, or any request where
+            search_api_operations already returned enough operation/schema
+            evidence. fallback_reason must state the specific planning blocker
+            that remained after OpenAPI search. This tool is read-only and
+            best-effort; it never executes Dionisio API operations.
             """
+            if runtime.operation_search_count < 1:
+                return {
+                    "error": {
+                        "code": "operation_search_required",
+                        "message": (
+                            "Call search_api_operations for this user request before "
+                            "using search_api_knowledge. GraphRAG is only a fallback "
+                            "after OpenAPI operation planning."
+                        ),
+                    }
+                }
+            if not fallback_reason.strip():
+                return {
+                    "error": {
+                        "code": "fallback_reason_required",
+                        "message": (
+                            "Provide the specific planning blocker that remained after "
+                            "search_api_operations. Use GraphRAG only as a last-resort fallback."
+                        ),
+                    }
+                }
             normalized_operation_id = _none_if_nullish(operation_id)
             return runtime.knowledge_base.search(
                 query=query,
@@ -272,6 +306,48 @@ def _none_if_nullish(value: str | None) -> str | None:
     if str(value).strip().lower() in {"", "none", "null", "undefined"}:
         return None
     return value
+
+
+def _include_workflow_operations(
+    catalog: OperationCatalog,
+    query: str,
+    matches: list[Operation],
+) -> list[Operation]:
+    operation_ids = _workflow_operation_ids_for_query(query)
+    if not operation_ids:
+        return matches
+
+    by_id = {operation.operation_id: operation for operation in matches}
+    expanded: list[Operation] = []
+    for operation_id in operation_ids:
+        try:
+            operation = catalog.get(operation_id)
+        except KeyError:
+            continue
+        expanded.append(operation)
+        by_id.pop(operation_id, None)
+    expanded.extend(by_id.values())
+    return expanded
+
+
+def _workflow_operation_ids_for_query(query: str) -> list[str]:
+    normalized = normalize_token(query)
+    mentions_reservation = any(term in normalized for term in ("reserva", "reservation"))
+    mentions_reschedule = any(term in normalized for term in ("remarc", "reschedul", "novo horario"))
+    mentions_client_name = any(term in normalized for term in ("cliente", "client", "nome", "name"))
+    mentions_availability = any(term in normalized for term in ("disponibilidade", "availability", "slot"))
+
+    if mentions_reservation and mentions_reschedule and mentions_client_name:
+        operation_ids = [
+            "clients.search",
+            "clients.reservations",
+            "reservations.get",
+        ]
+        if mentions_availability:
+            operation_ids.append("reservations.availability")
+        operation_ids.append("reservations.reschedule")
+        return operation_ids
+    return []
 
 
 def _operation_discovery_error(runtime: ToolRuntime, operation_id: str) -> dict[str, Any] | None:

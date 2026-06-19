@@ -34,6 +34,7 @@ def embedding_client_kwargs(settings: Settings) -> dict[str, Any]:
             "model": EMBEDDING_MODEL,
             "api_key": settings.require_openrouter_key(),
             "base_url": settings.openrouter_base_url,
+            "timeout": settings.graphrag_embedding_timeout_seconds,
         }
         if headers:
             kwargs["default_headers"] = headers
@@ -43,6 +44,7 @@ def embedding_client_kwargs(settings: Settings) -> dict[str, Any]:
         return {
             "model": OPENAI_EMBEDDING_MODEL,
             "api_key": settings.openai_api_key,
+            "timeout": settings.graphrag_embedding_timeout_seconds,
         }
 
     raise RuntimeError(

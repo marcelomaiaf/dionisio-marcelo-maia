@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any
 
 from dionisio_agent.config import Settings
@@ -20,6 +23,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Neo4jKnowledgeBase:
     settings: Settings
+    _neo4j_driver: Any = field(default=None, init=False, repr=False)
+    _vector_retriever: Any = field(default=None, init=False, repr=False)
+    _embedder: Any = field(default=None, init=False, repr=False)
+    _resource_lock: Any = field(default_factory=RLock, init=False, repr=False)
+    _search_cache: dict[tuple[str, str | None, str | None, int], tuple[float, dict[str, Any]]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def search(
         self,
@@ -31,6 +43,36 @@ class Neo4jKnowledgeBase:
     ) -> dict[str, Any]:
         try:
             clamped_limit = max(1, min(limit, 20))
+            cache_key = _cache_key(
+                query=query,
+                domain=domain,
+                operation_id=operation_id,
+                limit=clamped_limit,
+            )
+            cached = self._get_cached(cache_key)
+            if cached is not None:
+                logger.info(
+                    "dionisio_graphrag_search_cache_hit %s",
+                    json.dumps(
+                        {
+                            "query": query,
+                            "domain": domain,
+                            "operation_id": operation_id,
+                            "limit": clamped_limit,
+                            "item_count": len(cached.get("items", [])),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    extra={
+                        "query": query,
+                        "domain": domain,
+                        "operation_id": operation_id,
+                        "limit": clamped_limit,
+                        "item_count": len(cached.get("items", [])),
+                    },
+                )
+                return cached
             logger.info(
                 "dionisio_graphrag_search_started %s",
                 json.dumps(
@@ -61,7 +103,9 @@ class Neo4jKnowledgeBase:
                     ),
                     extra={"item_count": 0, "matched_keys": []},
                 )
-                return _empty_result(degraded=False)
+                result = _empty_result(degraded=False)
+                self._set_cached(cache_key, result)
+                return result
             items = self._hydrate_items(
                 keys_by_score=keys_by_score,
                 domain=domain,
@@ -82,10 +126,12 @@ class Neo4jKnowledgeBase:
                     "matched_keys": list(keys_by_score),
                 },
             )
-            return {
+            result = {
                 "items": items,
-                "meta": {"degraded": False, "error_logged": False},
+                "meta": {"degraded": False, "error_logged": False, "cache_hit": False},
             }
+            self._set_cached(cache_key, result)
+            return result
         except Exception as exc:  # pragma: no cover - exercised by integration/fallback tests
             logger.warning(
                 "dionisio_graphrag_search_degraded %s",
@@ -106,46 +152,25 @@ class Neo4jKnowledgeBase:
 
     def _semantic_keys(self, *, query: str, limit: int) -> dict[str, float]:
         try:
-            from neo4j import GraphDatabase
             from neo4j_graphrag.retrievers import VectorCypherRetriever
         except ImportError as exc:
             raise RuntimeError(
                 "neo4j-graphrag, openai, and neo4j are required for semantic GraphRAG search."
             ) from exc
 
-        retrieval_query = f"""
-        RETURN node.key AS key,
-               labels(node) AS labels,
-               node {{.*, {EMBEDDING_PROPERTY}: null, {EMBEDDING_TEXT_PROPERTY}: null}} AS properties,
-               score
-        """
-        driver = GraphDatabase.driver(
-            self.settings.require_neo4j_uri(),
-            auth=(self.settings.neo4j_username, self.settings.require_neo4j_password()),
+        retriever = self._get_vector_retriever(VectorCypherRetriever)
+        result = retriever.get_search_results(
+            query_text=query,
+            top_k=limit,
+            effective_search_ratio=self.settings.graphrag_effective_search_ratio,
         )
-        try:
-            embedder = create_openai_embedder(self.settings)
-            retriever = VectorCypherRetriever(
-                driver,
-                VECTOR_INDEX_NAME,
-                retrieval_query,
-                embedder=embedder,
-                neo4j_database=self.settings.neo4j_database,
-            )
-            result = retriever.get_search_results(
-                query_text=query,
-                top_k=limit,
-                effective_search_ratio=5,
-            )
-            scores: dict[str, float] = {}
-            for record in result.records:
-                key = record["key"]
-                score = record["score"]
-                if key:
-                    scores[str(key)] = float(score or 0.0)
-            return scores
-        finally:
-            driver.close()
+        scores: dict[str, float] = {}
+        for record in result.records:
+            key = record["key"]
+            score = record["score"]
+            if key:
+                scores[str(key)] = float(score or 0.0)
+        return scores
 
     def _hydrate_items(
         self,
@@ -154,30 +179,19 @@ class Neo4jKnowledgeBase:
         domain: str | None,
         operation_id: str | None,
     ) -> list[dict[str, Any]]:
-        try:
-            from neo4j import GraphDatabase
-        except ImportError as exc:
-            raise RuntimeError("neo4j package is required for GraphRAG hydration.") from exc
-
         keys = list(keys_by_score)
-        driver = GraphDatabase.driver(
-            self.settings.require_neo4j_uri(),
-            auth=(self.settings.neo4j_username, self.settings.require_neo4j_password()),
+        driver = self._get_driver()
+        nodes = _fetch_nodes(driver, self.settings, keys)
+        operations = _fetch_related_operations(driver, self.settings, keys)
+        workflow_keys_by_operation = _fetch_workflow_keys_for_operations(
+            driver,
+            self.settings,
+            _operation_keys(operations),
         )
-        try:
-            nodes = _fetch_nodes(driver, self.settings, keys)
-            operations = _fetch_related_operations(driver, self.settings, keys)
-            workflow_keys_by_operation = _fetch_workflow_keys_for_operations(
-                driver,
-                self.settings,
-                _operation_keys(operations),
-            )
-            _attach_workflow_keys(operations, workflow_keys_by_operation)
-            workflow_keys = _workflow_keys(nodes, operations)
-            workflows = _fetch_workflows(driver, self.settings, sorted(workflow_keys))
-            related = _fetch_operation_related(driver, self.settings, _operation_keys(operations))
-        finally:
-            driver.close()
+        _attach_workflow_keys(operations, workflow_keys_by_operation)
+        workflow_keys = _workflow_keys(nodes, operations)
+        workflows = _fetch_workflows(driver, self.settings, sorted(workflow_keys))
+        related = _fetch_operation_related(driver, self.settings, _operation_keys(operations))
 
         items: list[dict[str, Any]] = []
         for key in keys:
@@ -221,6 +235,128 @@ class Neo4jKnowledgeBase:
             )
         return items
 
+    def close(self) -> None:
+        with self._resource_lock:
+            if self._neo4j_driver is not None:
+                self._neo4j_driver.close()
+            self._neo4j_driver = None
+            self._vector_retriever = None
+            self._embedder = None
+            self._search_cache.clear()
+
+    def warmup(self) -> None:
+        try:
+            from neo4j_graphrag.retrievers import VectorCypherRetriever
+        except ImportError:
+            return
+        try:
+            started = time.perf_counter()
+            self._get_vector_retriever(VectorCypherRetriever)
+            logger.info(
+                "dionisio_graphrag_warmup_completed",
+                extra={"latency_seconds": round(time.perf_counter() - started, 4)},
+            )
+        except Exception as exc:  # pragma: no cover - best-effort startup optimization
+            logger.warning(
+                "dionisio_graphrag_warmup_degraded",
+                extra={
+                    "error_class": exc.__class__.__name__,
+                    "error_message": str(exc),
+                },
+            )
+
+    def _get_driver(self) -> Any:
+        if self._neo4j_driver is not None:
+            return self._neo4j_driver
+        try:
+            from neo4j import GraphDatabase
+        except ImportError as exc:
+            raise RuntimeError("neo4j package is required for GraphRAG hydration.") from exc
+
+        with self._resource_lock:
+            if self._neo4j_driver is None:
+                self._neo4j_driver = GraphDatabase.driver(
+                    self.settings.require_neo4j_uri(),
+                    auth=(self.settings.neo4j_username, self.settings.require_neo4j_password()),
+                    connection_timeout=self.settings.graphrag_neo4j_timeout_seconds,
+                    max_connection_lifetime=300,
+                )
+        return self._neo4j_driver
+
+    def _get_vector_retriever(self, retriever_cls: Any) -> Any:
+        if self._vector_retriever is not None:
+            return self._vector_retriever
+
+        with self._resource_lock:
+            if self._vector_retriever is None:
+                if self._embedder is None:
+                    self._embedder = create_openai_embedder(self.settings)
+                self._vector_retriever = retriever_cls(
+                    self._get_driver(),
+                    VECTOR_INDEX_NAME,
+                    _retrieval_query(),
+                    embedder=self._embedder,
+                    neo4j_database=self.settings.neo4j_database,
+                )
+        return self._vector_retriever
+
+    def _get_cached(
+        self,
+        cache_key: tuple[str, str | None, str | None, int],
+    ) -> dict[str, Any] | None:
+        ttl = self.settings.graphrag_cache_ttl_seconds
+        if ttl <= 0 or self.settings.graphrag_cache_max_entries <= 0:
+            return None
+        with self._resource_lock:
+            cached = self._search_cache.get(cache_key)
+            if cached is None:
+                return None
+            cached_at, result = cached
+            if time.monotonic() - cached_at > ttl:
+                self._search_cache.pop(cache_key, None)
+                return None
+            value = copy.deepcopy(result)
+        value.setdefault("meta", {})["cache_hit"] = True
+        return value
+
+    def _set_cached(
+        self,
+        cache_key: tuple[str, str | None, str | None, int],
+        result: dict[str, Any],
+    ) -> None:
+        if (
+            self.settings.graphrag_cache_ttl_seconds <= 0
+            or self.settings.graphrag_cache_max_entries <= 0
+        ):
+            return
+        with self._resource_lock:
+            if len(self._search_cache) >= self.settings.graphrag_cache_max_entries:
+                oldest_key = min(self._search_cache, key=lambda key: self._search_cache[key][0])
+                self._search_cache.pop(oldest_key, None)
+            self._search_cache[cache_key] = (time.monotonic(), copy.deepcopy(result))
+
+
+def _retrieval_query() -> str:
+    return f"""
+    RETURN node.key AS key,
+           labels(node) AS labels,
+           node {{.*, {EMBEDDING_PROPERTY}: null, {EMBEDDING_TEXT_PROPERTY}: null}} AS properties,
+           score
+    """
+
+
+def _cache_key(
+    *,
+    query: str,
+    domain: str | None,
+    operation_id: str | None,
+    limit: int,
+) -> tuple[str, str | None, str | None, int]:
+    normalized_query = " ".join(query.strip().lower().split())
+    normalized_domain = domain.strip().lower() if domain else None
+    normalized_operation_id = operation_id.strip() if operation_id else None
+    return (normalized_query, normalized_domain, normalized_operation_id, limit)
+
 
 def _fetch_nodes(driver: Any, settings: Settings, keys: list[str]) -> dict[str, dict[str, Any]]:
     records, _, _ = driver.execute_query(
@@ -233,6 +369,7 @@ def _fetch_nodes(driver: Any, settings: Settings, keys: list[str]) -> dict[str, 
         """,
         keys=keys,
         database_=settings.neo4j_database,
+        timeout=settings.graphrag_neo4j_timeout_seconds,
     )
     return {
         record["key"]: _format_node(record["labels"], record["properties"])
@@ -279,6 +416,7 @@ def _fetch_related_operations(
         """,
         keys=keys,
         database_=settings.neo4j_database,
+        timeout=settings.graphrag_neo4j_timeout_seconds,
     )
     return {record["key"]: list(record["operations"]) for record in records}
 
@@ -329,6 +467,7 @@ def _fetch_workflows(driver: Any, settings: Settings, workflow_keys: list[str]) 
         """,
         workflow_keys=workflow_keys,
         database_=settings.neo4j_database,
+        timeout=settings.graphrag_neo4j_timeout_seconds,
     )
     return {
         record["key"]: {
@@ -355,6 +494,7 @@ def _fetch_workflow_keys_for_operations(
         """,
         operation_keys=operation_keys,
         database_=settings.neo4j_database,
+        timeout=settings.graphrag_neo4j_timeout_seconds,
     )
     return {
         record["operation_id"]: [key for key in record["workflow_keys"] if key]
@@ -397,6 +537,7 @@ def _fetch_operation_related(
         """,
         operation_keys=operation_keys,
         database_=settings.neo4j_database,
+        timeout=settings.graphrag_neo4j_timeout_seconds,
     )
     return {
         record["operation_id"]: {

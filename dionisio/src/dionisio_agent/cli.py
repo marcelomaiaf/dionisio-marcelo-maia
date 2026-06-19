@@ -7,11 +7,21 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from agents import Runner, SQLiteSession
+from agents import MaxTurnsExceeded, Runner
 
 from dionisio_agent.config import Settings
 from dionisio_agent.factory import create_runtime
 from dionisio_agent.operation_catalog import OperationCatalog
+from dionisio_agent.sessions import create_limited_sqlite_session
+
+AGENT_MAX_TURNS_MESSAGE = (
+    "Nao consegui concluir essa operacao em poucas etapas. Para avancar mais rapido, "
+    "envie o nome ou ID exato do registro e a acao desejada em uma unica mensagem."
+)
+AGENT_EMPTY_OUTPUT_MESSAGE = (
+    "Nao recebi uma resposta final do modelo neste turno. Tente reenviar a mensagem "
+    "ou repetir o pedido com o ID do registro."
+)
 
 
 def main() -> None:
@@ -25,6 +35,7 @@ def main() -> None:
     chat_parser = subparsers.add_parser("chat")
     chat_parser.add_argument("--session-id", default="default")
     chat_parser.add_argument("--db-path", default=".dionisio_agent/sessions.sqlite")
+    chat_parser.add_argument("--history-limit", type=int, default=None)
 
     operations_parser = subparsers.add_parser("operations")
     operations_parser.add_argument("--query", default="")
@@ -41,14 +52,26 @@ async def _run(args: argparse.Namespace) -> None:
     settings = Settings.from_env()
     if args.command == "ask":
         agent, _runtime = await create_runtime(settings)
-        result = await Runner.run(agent, args.prompt)
-        print(result.final_output)
+        try:
+            result = await Runner.run(agent, args.prompt, max_turns=settings.agent_max_turns)
+        except MaxTurnsExceeded:
+            print(AGENT_MAX_TURNS_MESSAGE)
+            return
+        print(_result_text(result))
         return
 
     if args.command == "chat":
         agent, _runtime = await create_runtime(settings)
         Path(args.db_path).parent.mkdir(parents=True, exist_ok=True)
-        session = SQLiteSession(args.session_id, db_path=args.db_path)
+        session = create_limited_sqlite_session(
+            args.session_id,
+            db_path=args.db_path,
+            history_limit=(
+                args.history_limit
+                if args.history_limit is not None
+                else settings.web_chat_session_history_limit
+            ),
+        )
         print(
             f"Dionisio chat started. session_id={args.session_id}. "
             "Type 'exit', 'quit' or Ctrl+C to leave."
@@ -63,8 +86,17 @@ async def _run(args: argparse.Namespace) -> None:
                 return
             if not prompt:
                 continue
-            result = await Runner.run(agent, prompt, session=session)
-            print(f"\nagente> {result.final_output}")
+            try:
+                result = await Runner.run(
+                    agent,
+                    prompt,
+                    session=session,
+                    max_turns=settings.agent_max_turns,
+                )
+            except MaxTurnsExceeded:
+                print(f"\nagente> {AGENT_MAX_TURNS_MESSAGE}")
+                continue
+            print(f"\nagente> {_result_text(result)}")
 
         return
 
@@ -93,6 +125,16 @@ def _operation_to_dict(operation: Any) -> dict[str, Any]:
         "summary": operation.summary,
         "destructive": operation.destructive,
     }
+
+
+def _result_text(result: Any) -> str:
+    output = getattr(result, "final_output", None)
+    if output is None:
+        return AGENT_EMPTY_OUTPUT_MESSAGE
+    text = str(output)
+    if not text.strip():
+        return AGENT_EMPTY_OUTPUT_MESSAGE
+    return text
 
 
 if __name__ == "__main__":

@@ -6,9 +6,10 @@ build-backend = "hatchling.build"
 name = "dionisio-revops-agent"
 version = "0.1.0"
 description = "OpenAI Agents SDK assistant for the Dionisio RevOps case, using OpenRouter and a guarded API executor."
-readme = "README.md"
+readme = { text = "Dionisio RevOps Agent", content-type = "text/markdown" }
 requires-python = ">=3.11"
 dependencies = [
+  "fastapi>=0.115",
   "httpx>=0.27",
   "jsonschema>=4.22",
   "neo4j>=5.23",
@@ -16,6 +17,7 @@ dependencies = [
   "openai>=2.19,<3",
   "openai-agents>=0.3",
   "pydantic>=2.7",
+  "uvicorn[standard]>=0.32",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +30,7 @@ dev = [
 dionisio-agent = "dionisio_agent.cli:main"
 dionisio-evals = "evals.run_evals:main"
 dionisio-graphrag-ingest = "dionisio_agent.graphrag.ingest:main"
+dionisio-web = "dionisio_agent.web:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dionisio_agent", "evals"]

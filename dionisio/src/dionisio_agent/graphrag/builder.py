@@ -554,7 +554,7 @@ WORKFLOW_DEFINITIONS = {
             "remarcar reserva com notificacao ao cliente",
         ],
         "supported": False,
-        "missing_capabilities": ["client notification", "message sending", "WhatsApp/SMS/email endpoint"],
+        "missing_capabilities": ["client notification", "message sending", "messaging endpoint"],
         "decision_rule": "Offer to reschedule using reservation_reschedule_by_client_name, but explicitly say the API has no endpoint to notify the client.",
         "steps": (
             {"operation_id": "clients.search", "purpose": "Supported part: identify the client.", "requires_user_confirmation": True},
